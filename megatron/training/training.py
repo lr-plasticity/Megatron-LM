@@ -86,7 +86,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
     tag_params_for_buffer_routing,
 )
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer import FP32Optimizer, param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer.schedulefree_plus import ScheduleFreePlusAdamC
@@ -4305,7 +4305,9 @@ def _sfplus_set_weights(model, optimizer, sfplus_optimizers, eval_mode):
             opt.optimizer.eval()
         else:
             opt.optimizer.train()
-        opt._copy_main_params_to_model_params()
+        # FP32Optimizer has no separate main params: the swap above already set the weights.
+        if not isinstance(opt, FP32Optimizer):
+            opt._copy_main_params_to_model_params()
     if any(isinstance(opt, DistributedOptimizer) for opt in sfplus_optimizers):
         # Each rank only updated its own shard; all-gather the full weights.
         force_param_sync(model, optimizer=optimizer)
