@@ -12,7 +12,9 @@ Algorithm 1. Differences from the reference:
   so the global gradient L1 norm and the <g, z - x> correction are summed over an explicit
   process group (``reduce_group``) instead of relying on DTensor detection.
 - The loss is supplied by the training loop through ``set_function_value`` (already
-  averaged over the data-parallel group), so ``step()`` keeps the standard signature.
+  averaged over the data-parallel group), so ``step()`` keeps the standard signature. It
+  must use the same token/microbatch weighting as the loss behind the gradients (see
+  ``--calculate-per-token-loss``), or f and grad f in the Polyak step are different functions.
 - The gradient-L1 EMA stores its raw value and bias-corrects a copy. The reference writes
   the corrected value back into the EMA, which double-corrects when ``polyak_beta > 0``.
 - Beta annealing uses the 1-indexed step, as in the paper's Algorithm 1; the reference code

@@ -3489,18 +3489,28 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         losses_reduced, args, model_pg_collection
     )
 
-    # ScheduleFree+'s Polyak step size needs the loss at the current weights: the mean
-    # per-token loss over the global batch, the same value that is logged as 'lm loss'.
+    # ScheduleFree+'s Polyak step size needs the loss at the current weights, weighted the
+    # same way as the loss that produced the gradients; otherwise f(y) and grad f(y) in the
+    # step size belong to different functions whenever microbatches hold unequal token counts
+    # (e.g. masked SFT data). Each row of 'lm loss' is [loss sum, num tokens] for one microbatch.
     sfplus_optimizers = _sfplus_optimizers(optimizer)
     if sfplus_optimizers:
-        loss_sum_and_tokens = torch.vstack(
-            [x['lm loss'].view(-1) for x in losses_reduced]
-        ).sum(dim=0).float()
+        loss_reports = torch.vstack([x['lm loss'].view(-1) for x in losses_reduced]).float()
+        loss_sums, num_tokens = loss_reports[:, 0], loss_reports[:, 1]
+        if args.calculate_per_token_loss:
+            # Gradients are of the summed loss divided by the global token count.
+            loss_stats = torch.stack([loss_sums.sum(), num_tokens.sum()])
+        else:
+            # Gradients are of each microbatch's mean loss (clamped as in forward_step),
+            # averaged over microbatches and then over data-parallel ranks.
+            loss_stats = torch.stack(
+                [(loss_sums / num_tokens.clamp(min=1)).mean(), torch.ones_like(loss_sums[0])]
+            )
         torch.distributed.all_reduce(
-            loss_sum_and_tokens,
+            loss_stats,
             group=getattr(model_pg_collection, 'dp_cp_gtp_remat', None) or model_pg_collection.dp_cp,
         )
-        global_loss = (loss_sum_and_tokens[0] / loss_sum_and_tokens[1]).item()
+        global_loss = (loss_stats[0] / loss_stats[1]).item()
         for opt in sfplus_optimizers:
             opt.optimizer.set_function_value(global_loss)
 
