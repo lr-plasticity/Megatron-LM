@@ -125,6 +125,34 @@ class ScheduleFreePlusAdamC(torch.optim.Optimizer):
                     state['x'] = p.detach().clone()
 
     @torch.no_grad()
+    def edit_param_(self, p, fn) -> bool:
+        """Apply an in-place weight edit ``fn(tensor)`` (e.g. QK-Clip) to parameter ``p``.
+
+        Editing ``p`` alone does not last: it holds ``y`` (or ``x`` in eval mode), which the
+        next step and ``train()`` rebuild from ``x`` and ``z``. So ``fn`` is applied to ``x``
+        and ``z`` and ``p`` is rebuilt from them; for an edit that scales rows, ``y`` scales by
+        the same factor. Before the first step (no state yet) ``fn`` edits ``p``, from which
+        ``x`` and ``z`` are initialized. Returns False if ``p`` is not in this optimizer.
+        """
+        for group in self.param_groups:
+            if any(q is p for q in group['params']):
+                break
+        else:
+            return False
+        state = self.state[p]
+        if 'x' not in state:
+            fn(p)
+            return True
+        x, z = state['x'], state['z']
+        fn(x)
+        fn(z)
+        if group['train_mode']:
+            p.copy_(x).lerp_(z, group['y_weight'])
+        else:
+            p.copy_(x)
+        return True
+
+    @torch.no_grad()
     def eval(self):
         """Put ``x`` (the averaged weights) into the parameters."""
         for group in self.param_groups:

@@ -1838,6 +1838,13 @@ def validate_args(args, defaults={}):
             # Muon orthogonalizes whole matrices; the distributed optimizer shards them.
             assert not args.use_distributed_optimizer, \
                 'sfplus_muon requires the non-distributed optimizer'
+        if args.qk_clip:
+            # QK-Clip edits x and z through the fp32 main param, which must be the whole
+            # matrix; MLA's clip_qk edits the weights directly and would be undone.
+            assert not args.use_distributed_optimizer, \
+                'sfplus with --qk-clip requires the non-distributed optimizer'
+            assert not args.multi_latent_attention, \
+                'sfplus with --qk-clip does not support multi-latent attention'
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False

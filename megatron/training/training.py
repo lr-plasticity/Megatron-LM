@@ -3522,7 +3522,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
     if args.qk_clip or args.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+        # ScheduleFree+ rebuilds the weights from x and z each step: clip those instead.
+        log_max_attention_logit = clip_qk(
+            model,
+            log_max_only=not args.qk_clip,
+            edit_main_param=_sfplus_param_editor(sfplus_optimizers) if sfplus_optimizers else None,
+        )
 
     timers('optimizer').stop()
 
@@ -4294,6 +4299,16 @@ def _sfplus_set_weights(model, optimizer, sfplus_optimizers, eval_mode):
     if any(isinstance(opt, DistributedOptimizer) for opt in sfplus_optimizers):
         # Each rank only updated its own shard; all-gather the full weights.
         force_param_sync(model, optimizer=optimizer)
+
+
+def _sfplus_param_editor(sfplus_optimizers):
+    """``edit(main_param, fn)`` applying an in-place weight edit to ScheduleFree+'s x and z."""
+
+    def edit(main_param, fn):
+        if not any(opt.optimizer.edit_param_(main_param, fn) for opt in sfplus_optimizers):
+            raise RuntimeError('parameter is not in any ScheduleFree+ optimizer')
+
+    return edit
 
 
 def _sfplus_last_stats(optimizer):

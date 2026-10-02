@@ -5,13 +5,15 @@ import torch
 from megatron.core import parallel_state
 
 
-def clip_qk(model, log_max_only=False) -> float:
+def clip_qk(model, log_max_only=False, edit_main_param=None) -> float:
     """
     Clips QK attention logits to prevent numerical instability.
 
     Args:
         model (List[MegatronModule]): Model chunks containing attention layers.
         log_max_only (bool): If True, only computes max logit without clipping.
+        edit_main_param (Callable, optional): ``edit_main_param(main_param, fn)`` applying the
+            in-place clip ``fn`` through the optimizer (see ``SelfAttention.clip_qk``).
 
     Returns:
         float: The maximum QK logit value across all chunks.
@@ -39,7 +41,12 @@ def clip_qk(model, log_max_only=False) -> float:
                         ).item(),
                     )
                     if not log_max_only:
-                        transformer_layer.self_attention.clip_qk()
+                        if edit_main_param is None:
+                            transformer_layer.self_attention.clip_qk()
+                        else:
+                            transformer_layer.self_attention.clip_qk(
+                                edit_main_param=edit_main_param
+                            )
                     else:
                         # When qk-clip is disabled, clip_qk() is not called and
                         # would otherwise never reset current_max_attn_logits.
