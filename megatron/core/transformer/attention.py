@@ -2045,10 +2045,16 @@ class SelfAttention(Attention):
 
         set_save_original_input(self.linear_qkv)
 
-    def clip_qk(self):
+    def clip_qk(self, edit_main_param=None):
         """
         QK Clipping is a technique to clip the query and key attention logits to prevent the
         attention logits from exploding. This function is experimental on GQA.
+
+        Args:
+            edit_main_param: optional ``edit_main_param(main_param, fn)`` that applies the
+                in-place edit ``fn`` to the optimizer's copy of the weight, for optimizers
+                whose state the weight is rebuilt from (ScheduleFree+'s ``x`` and ``z``).
+                The model weight is then copied from the edited main param.
         """
         if not self.config.qk_clip:
             raise ValueError("qk_clip option needs to be enabled")
@@ -2083,13 +2089,21 @@ class SelfAttention(Attention):
             ).view(self.num_query_groups_per_partition, 1, 1)
             assert torch.all(self.qk_clip_balancing_eta <= 1.0)
 
-            # Handle different weight access patterns (main_param vs direct access)
-            if hasattr(self.linear_qkv.weight, 'main_param'):
-                self.linear_qkv.weight.main_param.data.copy_(
-                    self._clip_linear_qkv(self.linear_qkv.weight.main_param.data)
+            weight = self.linear_qkv.weight
+            main_param = getattr(weight, 'main_param', None)
+            if edit_main_param is not None:
+                edit_main_param(
+                    weight if main_param is None else main_param,
+                    lambda t: t.copy_(self._clip_linear_qkv(t)),
                 )
+                if main_param is not None:
+                    weight.data.copy_(main_param.data)
+            else:
+                # Handle different weight access patterns (main_param vs direct access)
+                if main_param is not None:
+                    main_param.data.copy_(self._clip_linear_qkv(main_param.data))
 
-            self.linear_qkv.weight.data.copy_(self._clip_linear_qkv(self.linear_qkv.weight.data))
+                weight.data.copy_(self._clip_linear_qkv(weight.data))
 
         # reset current_max_attn_logits
         self.core_attention.current_max_attn_logits = None

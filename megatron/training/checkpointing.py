@@ -1263,6 +1263,18 @@ def save_checkpoint(
         else:
             onelogger_finalize_fn()
 
+    # The wandb callback below (last rank) adds the tracker file that rank 0 writes above to
+    # the artifact; without a barrier it can look for the file before rank 0 has written it.
+    # Every rank checks args.wandb_project (the wandb writer exists only on the last rank),
+    # so all ranks agree on whether to wait.
+    if (
+        not skip_weight_ckpt
+        and not args.async_save
+        and getattr(args, 'wandb_project', None)
+        and torch.distributed.is_initialized()
+    ):
+        torch.distributed.barrier()
+
     # Additional callback for wandb (last rank)
     if not skip_weight_ckpt and (
         not torch.distributed.is_initialized() or is_last_rank()
