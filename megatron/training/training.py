@@ -5248,6 +5248,17 @@ def train(
         prof.start()
 
     start_iteration = iteration
+    weight_snapshots = None
+    if args.weight_snapshot_dir:
+        from megatron.training.weight_snapshots import WeightSnapshots
+
+        weight_snapshots = WeightSnapshots(
+            model,
+            optimizer,
+            args.weight_snapshot_dir,
+            args.weight_snapshot_block_interval,
+            args.weight_snapshot_raw_interval,
+        )
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
@@ -5556,6 +5567,8 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        if weight_snapshots is not None:
+            weight_snapshots.step(iteration)
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (

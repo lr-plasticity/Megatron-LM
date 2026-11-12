@@ -3358,6 +3358,14 @@ def _add_checkpointing_args(parser):
                        help='Override the iteration stored in the loaded checkpoint. '
                             'Also resets consumed_train_samples accordingly so the '
                             'data loader replays samples from that iteration onward.')
+    group.add_argument('--weight-snapshot-dir', type=str, default=None,
+                       help='Write dense snapshots of the fp32 master weights here, for '
+                            'post-hoc weight averaging (see megatron/training/weight_snapshots.py).')
+    group.add_argument('--weight-snapshot-block-interval', type=int, default=0,
+                       help='Save the mean of the weights over every block of this many steps '
+                            '(0: off).')
+    group.add_argument('--weight-snapshot-raw-interval', type=int, default=0,
+                       help='Save the weights every this many steps (0: off).')
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
