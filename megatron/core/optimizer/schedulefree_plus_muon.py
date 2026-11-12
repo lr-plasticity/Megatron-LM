@@ -36,6 +36,12 @@ so for the same decay its matrices settle 2-3x larger than AdamC's (measured at 
 ~0.28 vs ~0.11). ``muon_weight_decay`` sets the Muon matrices' decay separately; the decay also
 sets how fast the norm reaches equilibrium, ~1 / (2 * lr**2 * wd) steps.
 
+Norm-gain decay (``gain_decay``). Norm gains are undecayed in Megatron, and a gain and the
+matrix after it only matter as a product, so they grow as the decayed matrices shrink. A
+positive ``gain_decay`` applies AdamC-form decay toward the gains' neutral value instead of 0,
+``z -= lr**2 * gain_decay * (y - target)`` (target 1, or 0 for zero-centered gamma), which
+leaves the initial value unpenalized.
+
 Muon needs whole matrices, so this optimizer requires the non-distributed optimizer (every
 data-parallel rank holds all fp32 params and gradients and runs the same step).
 """
@@ -102,11 +108,15 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
             the Muon and the AdamC parameters.
         muon_weight_decay: AdamC-form weight decay of the Muon matrices; None uses the
             group's ``weight_decay``. Groups with ``weight_decay`` 0 stay undecayed.
+        gain_decay: AdamC-form decay of norm gains toward their neutral value; 0 leaves
+            them to their group's ``weight_decay``.
 
     Which parameters use Muon is decided from the model parameters passed in: 2D and not
     tagged ``is_embedding_or_output_parameter``. A parameter with an ``sfplus_qkv_split``
     attribute (row counts of one query group's q, k and v blocks) is orthogonalized as three
     matrices, all q rows, all k rows and all v rows, as Megatron's Muon does with split_qkv.
+    Norm gains are the parameters with an ``sfplus_norm_gain_target`` attribute (their
+    neutral value).
     """
 
     def __init__(
@@ -118,9 +128,11 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
         muon_coefficient_type: str = "quintic",
         muon_rms: float = 0.2,
         muon_weight_decay: Optional[float] = None,
+        gain_decay: float = 0.0,
         **kwargs,
     ):
         super().__init__(params, **kwargs)
+        self.gain_decay = gain_decay
         self.muon_momentum = muon_momentum
         self.muon_nesterov = muon_nesterov
         self.muon_ns_steps = muon_ns_steps
@@ -137,6 +149,12 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
         # lose the attributes) in place, and loading a checkpoint keeps the group order.
         self.muon_splits = [
             [self._muon_split(p) for p in group['params']] for group in self.param_groups
+        ]
+        # Neutral value per parameter position for norm gains, None otherwise (by position
+        # for the same reason as muon_splits).
+        self.gain_targets = [
+            [getattr(p, 'sfplus_norm_gain_target', None) for p in group['params']]
+            for group in self.param_groups
         ]
 
     @staticmethod
@@ -257,10 +275,13 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
         numerator = self.function_value + ip_term
         polyak_lr = max(0.0, numerator) / max(denominator_ema_corr, 1e-30)
 
-        # Squared L2 norms of x and z after this step, split into AdamC and Muon params:
-        # [adam x, adam z, muon x, muon z].
-        norms_sq = torch.zeros(4, dtype=torch.float64, device=device)
-        for group, splits in zip(self.param_groups, self.muon_splits):
+        # Squared L2 norms of x and z after this step, split into AdamC and Muon params, plus
+        # the norm gains (also counted in AdamC): [adam x, adam z, muon x, muon z, gain x,
+        # gain z].
+        norms_sq = torch.zeros(6, dtype=torch.float64, device=device)
+        for group, splits, gain_targets in zip(
+            self.param_groups, self.muon_splits, self.gain_targets
+        ):
             beta1, beta2 = group['betas']
             eps = group['eps']
             decay = group['weight_decay']
@@ -284,7 +305,7 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
             bias_correction1 = 1 - beta1 ** (k + 1)
             bias_correction2 = 1 - beta2 ** (k + 1)
 
-            for p, split in zip(group['params'], splits):
+            for p, split, gain_target in zip(group['params'], splits, gain_targets):
                 if p.grad is None:
                     continue
                 g = p.grad
@@ -292,10 +313,17 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
                 exp_avg = state['exp_avg']
                 z, x = state['z'], state['x']
 
-                # AdamC weight decay on z, applied at y (the current parameter value).
-                param_decay = decay if split is None else muon_decay
-                if param_decay != 0:
-                    z.add_(p, alpha=-lr * lr * param_decay)
+                # AdamC weight decay on z, applied at y (the current parameter value); norm
+                # gains decay toward their neutral value when gain_decay is set.
+                if gain_target is not None and self.gain_decay != 0:
+                    decay_rate = lr * lr * self.gain_decay
+                    z.add_(p, alpha=-decay_rate)
+                    if gain_target != 0:
+                        z.add_(decay_rate * gain_target)
+                else:
+                    param_decay = decay if split is None else muon_decay
+                    if param_decay != 0:
+                        z.add_(p, alpha=-lr * lr * param_decay)
 
                 if split is None:
                     exp_avg_sq = state['exp_avg_sq']
@@ -313,14 +341,19 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
                 # y = sf_beta * x + (1 - sf_beta) * z
                 p.copy_(x).lerp_(z, y_weight)
                 offset = 0 if split is None else 2
-                norms_sq[offset] += torch.dot(x.view(-1), x.view(-1))
-                norms_sq[offset + 1] += torch.dot(z.view(-1), z.view(-1))
+                x_sq = torch.dot(x.view(-1), x.view(-1))
+                z_sq = torch.dot(z.view(-1), z.view(-1))
+                norms_sq[offset] += x_sq
+                norms_sq[offset + 1] += z_sq
+                if gain_target is not None:
+                    norms_sq[4] += x_sq
+                    norms_sq[5] += z_sq
 
             group['k'] = k + 1
 
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(norms_sq, group=self.reduce_group)
-        adam_x_sq, adam_z_sq, muon_x_sq, muon_z_sq = norms_sq.tolist()
+        adam_x_sq, adam_z_sq, muon_x_sq, muon_z_sq, gain_x_sq, gain_z_sq = norms_sq.tolist()
         denominator = adam_denominator + muon_denominator
         self.last_stats = {
             'effective_lr': max(group0['lr'], group0['eps']) * polyak_lr,
@@ -350,6 +383,8 @@ class ScheduleFreePlusMuon(ScheduleFreePlusAdamC):
             'sf_beta': sf_beta,
             'ckp1': ckp1 if self.param_groups else 1.0,
             'grad_clip_coeff': grad_clip_coeff,
+            'gain_x_norm': math.sqrt(gain_x_sq),
+            'gain_z_norm': math.sqrt(gain_z_sq),
         }
         self.function_value = None
         self.grad_clip_coeff = 1.0

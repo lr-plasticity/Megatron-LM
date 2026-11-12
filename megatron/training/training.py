@@ -3405,6 +3405,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             scheduled_num_microbatches = get_num_microbatches()
 
+        # SAM replays this step's microbatches at the perturbed weights: record them.
+        sam_active = args.sam_rho > 0 and args.consumed_train_samples >= args.sam_start_samples
+        fb_data_iterator = _sam_record(data_iterator) if sam_active else data_iterator
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -3417,21 +3421,42 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
+        forward_backward_kwargs = dict(
+            forward_step_func=forward_step_func,
+            model=model,
+            num_microbatches=scheduled_num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=forward_only,
+            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+            force_all_reduce=save_wgrads_in_this_iteration,
+            p2p_communicator=p2p_communicator,
+            pg_collection=pg_collection,
+        )
         with grad_context, _fb_cm:
             losses_reduced = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=forward_only,
-                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-                force_all_reduce=save_wgrads_in_this_iteration,
-                p2p_communicator=p2p_communicator,
-                pg_collection=pg_collection,
+                data_iterator=fb_data_iterator, **forward_backward_kwargs
             )
+
+        # Sharpness-Aware Minimization: redo forward-backward on the same microbatches at
+        # w + rho * g / ||g||, then restore w. The optimizer steps from w with the perturbed
+        # gradient; losses_reduced keeps the loss at w for logging.
+        _SAM_LAST_STATS.clear()
+        if sam_active:
+            sam_saved_params, sam_grad_norm = _sam_ascend(model, optimizer, args.sam_rho)
+            for model_chunk in model:
+                model_chunk.zero_grad_buffer()
+            optimizer.zero_grad()
+            with _forward_backward_grad_context(args)[0]:
+                sam_losses_reduced = forward_backward_func(
+                    data_iterator=_sam_replay(fb_data_iterator), **forward_backward_kwargs
+                )
+            _sam_restore(sam_saved_params)
+            _SAM_LAST_STATS.update(
+                _sam_stats(model, losses_reduced, sam_losses_reduced, sam_grad_norm)
+            )
+
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -3561,6 +3586,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
+    if _SAM_LAST_STATS and not update_successful:
+        # A skipped step leaves the model weights at SAM's perturbed point: put them back at w.
+        _sam_sync_model_params(model, optimizer)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
@@ -4287,6 +4315,103 @@ def force_param_sync(model_chunks, optimizer=None) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+# Statistics from the last SAM step ({} when SAM was not applied), logged under sam/.
+_SAM_LAST_STATS = {}
+
+
+class _MicrobatchRecorder:
+    """Iterator that keeps the microbatches it yields, so SAM can feed them again."""
+
+    def __init__(self, iterator):
+        self.iterator = iterator
+        self.microbatches = []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        microbatch = next(self.iterator)
+        # Shallow copy, as RerunDataIterator does: get_batch may edit the dict it receives.
+        self.microbatches.append(copy.copy(microbatch))
+        return microbatch
+
+
+def _sam_record(data_iterator):
+    """Wrap a data iterator (or a list of them, one per model chunk) in recorders."""
+    if isinstance(data_iterator, list):
+        return [_sam_record(it) for it in data_iterator]
+    return None if data_iterator is None else _MicrobatchRecorder(data_iterator)
+
+
+def _sam_replay(recorded):
+    """Iterators over the microbatches the recorders from _sam_record have yielded."""
+    if isinstance(recorded, list):
+        return [_sam_replay(it) for it in recorded]
+    return None if recorded is None else iter(recorded.microbatches)
+
+
+def _sam_sync_model_params(model, optimizer):
+    """Copy the main params into the model weights, all-gathering distributed shards."""
+    chained = getattr(optimizer, 'chained_optimizers', [optimizer])
+    for opt in chained:
+        # FP32Optimizer has no separate main params: its params are the model weights.
+        if not isinstance(opt, FP32Optimizer):
+            opt._copy_main_params_to_model_params()
+    if any(isinstance(opt, DistributedOptimizer) for opt in chained):
+        # Each rank only updated its own shard; all-gather the full weights.
+        force_param_sync(model, optimizer=optimizer)
+
+
+@torch.no_grad()
+def _sam_ascend(model, optimizer, rho):
+    """Move the weights from w to w + rho * g / ||g|| (Foret et al., 2021).
+
+    g is the global-batch gradient that the first forward-backward pass left in the grad
+    buffers. Returns the saved main params for _sam_restore and ||g||.
+    """
+    optimizer.prepare_grads()  # Copies g into the main params' .grad (no loss scaling here).
+    grad_norm = float(optimizer.get_grad_norm())
+    scale = rho / max(grad_norm, 1e-12)
+    saved_params = []
+    for param in optimizer.get_parameters():
+        if param.grad is None:
+            continue
+        saved_params.append((param, param.detach().clone()))
+        param.add_(param.grad, alpha=scale)
+    _sam_sync_model_params(model, optimizer)
+    return saved_params, grad_norm
+
+
+@torch.no_grad()
+def _sam_restore(saved_params):
+    """Put the main params back at w. optimizer.step() then refreshes the model weights."""
+    for param, value in saved_params:
+        param.copy_(value)
+
+
+def _sam_stats(model, losses_reduced, sam_losses_reduced, grad_norm):
+    """Loss at w and at w + eps over the global batch, and ||g|| at w."""
+    stats = {'grad_norm': grad_norm}
+    # Only the last pipeline stage has losses.
+    if not losses_reduced or 'lm loss' not in losses_reduced[0]:
+        return stats
+    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
+    # Each row of 'lm loss' is [loss sum, num tokens] for one microbatch.
+    sums = torch.stack(
+        [
+            torch.vstack([x['lm loss'].view(-1) for x in losses]).float().sum(dim=0)
+            for losses in (losses_reduced, sam_losses_reduced)
+        ]
+    )
+    torch.distributed.all_reduce(sums, group=dp_cp_group)
+    loss, perturbed_loss = (sums[:, 0] / sums[:, 1]).tolist()
+    stats.update(loss=loss, perturbed_loss=perturbed_loss, loss_increase=perturbed_loss - loss)
+    return stats
+
+
 def _sfplus_optimizers(optimizer):
     """Megatron optimizers in `optimizer` whose inner optimizer is ScheduleFree+."""
     if optimizer is None:
@@ -4329,8 +4454,8 @@ def _sfplus_last_stats(optimizer):
     return sfplus_optimizers[0].optimizer.last_stats if sfplus_optimizers else {}
 
 
-def _log_sfplus_stats(stats, iteration):
-    """Write ScheduleFree+ step statistics to TensorBoard and W&B."""
+def _log_optimizer_stats(prefix, stats, iteration):
+    """Write optimizer step statistics (ScheduleFree+, SAM) to TensorBoard and W&B."""
     args = get_args()
     if iteration % args.tensorboard_log_interval != 0:
         return
@@ -4338,9 +4463,9 @@ def _log_sfplus_stats(stats, iteration):
     wandb_writer = get_wandb_writer()
     if writer:
         for key, value in stats.items():
-            writer.add_scalar(f'sfplus/{key}', value, iteration)
+            writer.add_scalar(f'{prefix}/{key}', value, iteration)
     if wandb_writer:
-        wandb_writer.log({f'sfplus/{key}': value for key, value in stats.items()}, iteration)
+        wandb_writer.log({f'{prefix}/{key}': value for key, value in stats.items()}, iteration)
 
 
 def _log_params_distance(distances, iteration):
@@ -5548,7 +5673,9 @@ def train(
             if sfplus_stats:
                 # The scheduler LR is only a warmup multiplier; log the step size actually used.
                 learning_rate = sfplus_stats['effective_lr']
-                _log_sfplus_stats(sfplus_stats, iteration)
+                _log_optimizer_stats('sfplus', sfplus_stats, iteration)
+            if _SAM_LAST_STATS:
+                _log_optimizer_stats('sam', _SAM_LAST_STATS, iteration)
             # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
             # uninstrumented per-iteration overhead outside the train_step span.
             with _otel_managed_span('step', 'megatron.train.log', is_goodput_span=True):

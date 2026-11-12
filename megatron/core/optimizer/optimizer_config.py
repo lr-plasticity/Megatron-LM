@@ -362,6 +362,11 @@ class OptimizerConfig:
     matrices, which settle at a different weight norm than AdamC params for the same decay.
     None uses weight_decay. Parameters Megatron excludes from weight decay stay undecayed."""
 
+    sfplus_muon_gain_decay: float = 0.0
+    """ScheduleFree+ with Muon: AdamC-form decay of norm gains toward their neutral value
+    (z -= lr**2 * gain_decay * (y - 1), or toward 0 for zero-centered gamma). 0 leaves the
+    gains to their parameter group's weight decay (none, by default)."""
+
     soap_shampoo_beta: float = 0.95
     """The beta parameter for the Shampoo preconditioner."""
 

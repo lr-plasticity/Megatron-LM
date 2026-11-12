@@ -1846,6 +1846,19 @@ def validate_args(args, defaults={}):
             assert not args.multi_latent_attention, \
                 'sfplus with --qk-clip does not support multi-latent attention'
 
+    if args.sam_rho > 0:
+        # SAM moves the fp32 main params up the gradient left in them by prepare_grads(),
+        # all-gathers the moved weights, and restores the main params before the real step.
+        assert args.optimizer in ('adam', 'sgd'), 'SAM supports --optimizer adam and sgd'
+        assert not args.fp16, 'SAM supports bf16 and fp32, not fp16 loss scaling'
+        assert not args.optimizer_cpu_offload, 'SAM does not support optimizer CPU offload'
+        assert not args.use_precision_aware_optimizer, \
+            'SAM does not support the precision-aware optimizer'
+        assert not args.use_megatron_fsdp and not args.use_torch_fsdp2, \
+            'SAM does not support FSDP'
+        assert not args.overlap_param_gather_with_optimizer_step, \
+            'SAM does not support --overlap-param-gather-with-optimizer-step'
+
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
     # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
@@ -2956,6 +2969,17 @@ def _add_regularization_args(parser):
     group.add_argument('--sfplus-muon-weight-decay', type=float, default=None,
                        help='ScheduleFree+ with Muon: AdamC-form weight decay for the Muon '
                        'matrices (default: --weight-decay).')
+    group.add_argument('--sfplus-muon-gain-decay', type=float, default=0.0,
+                       help='ScheduleFree+ with Muon: AdamC-form decay of norm gains toward 1 '
+                       '(0 for zero-centered gamma). 0 disables it.')
+    group.add_argument('--sam-rho', type=float, default=0.0,
+                       help='Sharpness-Aware Minimization (Foret et al., 2021): take the '
+                       'gradient for each optimizer step at w + rho * g / ||g||, where g is the '
+                       'global-batch gradient at w, on the same microbatches. Costs a second '
+                       'forward-backward pass per step. 0 disables SAM.')
+    group.add_argument('--sam-start-samples', type=int, default=0,
+                       help='SAM: apply it only once this many training samples have been '
+                       'consumed (e.g. the start of the WSD decay). 0 applies it throughout.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '

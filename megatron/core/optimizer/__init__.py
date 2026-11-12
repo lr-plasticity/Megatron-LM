@@ -654,6 +654,18 @@ def _get_megatron_optimizer_based_on_param_groups(
                         for name, param in model_chunk.named_parameters():
                             if name.endswith('self_attention.linear_qkv.weight'):
                                 param.sfplus_qkv_split = qkv_split
+                # Tag norm gains with their neutral value, for gain decay and logging.
+                gain_target = (
+                    0.0
+                    if getattr(model_chunks[0].config, 'layernorm_zero_centered_gamma', False)
+                    else 1.0
+                )
+                for model_chunk in model_chunks:
+                    for name, param in model_chunk.named_parameters():
+                        if param.dim() == 1 and (
+                            name.endswith('layer_norm_weight') or name.endswith('norm.weight')
+                        ):
+                            param.sfplus_norm_gain_target = gain_target
                 optimizer = ScheduleFreePlusMuon(
                     param_groups,
                     muon_momentum=config.muon_momentum,
@@ -662,6 +674,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     muon_coefficient_type=config.muon_coefficient_type,
                     muon_rms=config.sfplus_muon_rms,
                     muon_weight_decay=config.sfplus_muon_weight_decay,
+                    gain_decay=config.sfplus_muon_gain_decay,
                     **sfplus_kwargs,
                 )
 
