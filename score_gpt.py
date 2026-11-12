@@ -23,10 +23,13 @@ import torch
 import pretrain_gpt
 from megatron.core.enums import ModelType
 from megatron.training import get_args, get_timers, inprocess_restart, pretrain
-from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    gpt_data_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import set_run_config
 
 
 def score_func(loss_mask, labels, logits):
@@ -77,11 +80,13 @@ if __name__ == "__main__":
     pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
     assert args.skip_train, 'score_gpt.py only evaluates; pass --skip-train'
+    # As pretrain_gpt.py: the run config carries the dataset config and is registered globally.
     full_config = pretrain_cfg_container_from_args(
-        args, gpt_config_from_args(args, vocab_size_from_tokenizer=True))
-    # As pretrain_gpt.py: runtime services (timers, tokenizer, microbatches) before pretrain().
-    initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
+        args,
+        gpt_config_from_args(args, vocab_size_from_tokenizer=True),
+        data_cfg=gpt_data_config_from_args(args),
+    )
+    set_run_config(full_config)
     pretrain_fn(
         full_config,
         pretrain_gpt.train_valid_test_datasets_provider,
